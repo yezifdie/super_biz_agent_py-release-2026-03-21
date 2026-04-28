@@ -35,13 +35,15 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
-# 延迟导入 MinerU 相关模块
+# 延迟导入 MinerU 相关模块（magic-pdf v1.3.12 API）
 _magic_pdf_available = False
 _magic_pdf_import_error = None
 
 try:
-    from magic_pdf.data.io_parse import pipe_parse
-    from magic_pdf.model.doc_bin import DocBin
+    from magic_pdf.tools.common import do_parse
+    from magic_pdf.data.read_api import PymuDocDataset
+    from magic_pdf.libs.config_reader import get_device
+    import magic_pdf.model as model_config
     _magic_pdf_available = True
 except ImportError as e:
     _magic_pdf_import_error = str(e)
@@ -166,19 +168,19 @@ class MinerUParser:
             )
             self._initialized = False
             return
-        
+
         try:
-            # MinerU 初始化逻辑
-            # 实际使用时会加载模型，这一步比较耗时
-            logger.info("初始化 MinerU 解析引擎...")
-            
             # 设置设备
             if self._has_gpu:
                 os.environ['CUDA_VISIBLE_DEVICES'] = str(self.config.gpu_device)
-            
+
+            # 检查 MinerU 配置
+            device = get_device()
+            logger.info(f"MinerU 设备模式: {device}")
+
             self._initialized = True
             logger.info("MinerU 解析器初始化完成")
-            
+
         except Exception as e:
             logger.error(f"MinerU 初始化失败: {e}")
             self._initialized = False
@@ -267,90 +269,165 @@ class MinerUParser:
             return self._parse_pdf_fallback(file_path, warnings, metadata)
     
     def _parse_pdf_with_mineru(
-        self, 
-        file_path: str, 
+        self,
+        file_path: str,
         warnings: List[str],
         metadata: Dict[str, Any]
     ) -> 'ParseResult':
         """使用 MinerU 解析 PDF
-        
+
         Args:
             file_path: PDF 文件路径
             warnings: 警告信息列表
             metadata: 元数据字典
-            
+
         Returns:
             ParseResult: 解析结果
         """
         from app.services.document_parser.base_parser import ParseResult
-        
+
         try:
             logger.info(f"使用 MinerU 解析 PDF: {file_path}")
-            
-            # 读取 PDF 文件
-            with open(file_path, 'rb') as f:
-                pdf_bytes = f.read()
-            
-            # 创建文档对象
-            doc_bin = DocBin()
-            doc_bin.read_pdf(pdf_bytes)
-            
-            # 执行解析
-            parse_result = pipe_parse(
-                doc_bin,
-                self.config.parse_mode,
-                self.config.ocr_enabled,
-                self.config.ocr_lang,
+
+            pdf_path = Path(file_path)
+            pdf_bytes = pdf_path.read_bytes()
+            pdf_file_name = pdf_path.stem
+
+            # 创建临时输出目录
+            import tempfile
+            output_dir = tempfile.mkdtemp(prefix="mineru_")
+
+            # 映射解析模式
+            parse_method_map = {
+                "auto": "auto",
+                "ocr": "ocr",
+                "txt": "txt",
+            }
+            parse_method = parse_method_map.get(
+                self.config.parse_mode, "auto"
             )
-            
-            # 提取内容
-            content_parts = []
-            page_count = 0
+
+            # 调用 MinerU do_parse（返回 Markdown 和 JSON 文件路径）
+            do_parse(
+                output_dir=output_dir,
+                pdf_file_name=pdf_file_name,
+                pdf_bytes_or_dataset=pdf_bytes,
+                model_list=[],  # 使用内置模型
+                parse_method=parse_method,
+                f_draw_span_bbox=False,
+                f_draw_layout_bbox=False,
+                f_dump_md=True,
+                f_dump_middle_json=True,
+                f_dump_model_json=False,
+                f_dump_orig_pdf=False,
+                f_dump_content_list=False,
+                lang=self.config.ocr_lang if self.config.ocr_enabled else None,
+            )
+
+            # 读取生成的 Markdown 文件
+            md_path = Path(output_dir) / f"{pdf_file_name}.md"
+            if md_path.exists():
+                content = md_path.read_text(encoding="utf-8")
+            else:
+                # 尝试从 content_list 重建
+                content = self._rebuild_from_content_list(output_dir, pdf_file_name)
+
+            # 读取 middle_json 获取页数等信息
+            import json
+            middle_json_path = Path(output_dir) / f"{pdf_file_name}_middle.json"
             table_count = 0
             formula_count = 0
-            
-            for page_info in parse_result.get('page_list', []):
-                page_count += 1
-                page_md = self._extract_page_content(page_info)
-                content_parts.append(page_md)
-                
-                # 统计表格和公式
-                if page_info.get('table_count', 0) > 0:
-                    table_count += page_info['table_count']
-                if page_info.get('formula_count', 0) > 0:
-                    formula_count += page_info['formula_count']
-            
-            content = '\n\n'.join(content_parts)
-            
-            # 更新元数据
+            page_count = 0
+            if middle_json_path.exists():
+                try:
+                    with open(middle_json_path, "r", encoding="utf-8") as f:
+                        middle_data = json.load(f)
+                    if isinstance(middle_data, list):
+                        page_count = len(middle_data)
+                    elif isinstance(middle_data, dict):
+                        page_count = middle_data.get("page_count", len(middle_data.get("pdf_info", [])))
+                        pdf_info = middle_data.get("pdf_info", [])
+                        for page in pdf_info:
+                            for block in page.get("preproc_blocks", []):
+                                if block.get("type") == "table":
+                                    table_count += 1
+                except Exception:
+                    pass
+
             metadata.update({
                 "page_count": page_count,
                 "table_count": table_count,
                 "formula_count": formula_count,
                 "content_length": len(content),
+                "output_dir": output_dir,
             })
-            
-            # 清理内容
+
             content = self._sanitize_content(content)
-            
+
             logger.info(
-                f"PDF 解析完成: {page_count} 页, "
+                f"MinerU PDF 解析完成: {page_count} 页, "
                 f"{table_count} 个表格, "
-                f"{formula_count} 个公式, "
                 f"{len(content)} 字符"
             )
-            
+
             return ParseResult(
                 content=content,
                 metadata=metadata,
                 warnings=warnings
             )
-            
+
         except Exception as e:
             logger.error(f"MinerU PDF 解析失败: {e}，尝试降级解析")
             warnings.append(f"MinerU 解析失败，使用降级方案: {e}")
             return self._parse_pdf_fallback(file_path, warnings, metadata)
+
+    def _rebuild_from_content_list(
+        self, output_dir: str, pdf_file_name: str
+    ) -> str:
+        """从 content_list JSON 重建 Markdown 内容"""
+        content_list_path = Path(output_dir) / f"{pdf_file_name}_content_list.json"
+        if not content_list_path.exists():
+            return ""
+
+        import json
+        try:
+            with open(content_list_path, "r", encoding="utf-8") as f:
+                content_list = json.load(f)
+
+            parts = []
+            for item in content_list:
+                block_type = item.get("type", "text")
+                text = item.get("text", "")
+
+                if block_type == "text":
+                    parts.append(text)
+                elif block_type == "title":
+                    parts.append(f"## {text}")
+                elif block_type == "table":
+                    table_md = self._convert_table_to_markdown(item.get("table_data", []))
+                    if table_md:
+                        parts.append(table_md)
+                elif block_type == "formula":
+                    parts.append(f"${item.get('content', '')}$")
+
+            return "\n\n".join(parts)
+        except Exception:
+            return ""
     
+    def get_status(self) -> Dict[str, Any]:
+        """获取解析器状态
+
+        Returns:
+            Dict: 状态信息
+        """
+        return {
+            "available": self.is_available(),
+            "gpu_available": self._has_gpu,
+            "magic_pdf_available": _magic_pdf_available,
+            "magic_pdf_error": _magic_pdf_import_error,
+            "config": self.config.to_dict(),
+        }
+
     def _extract_page_content(self, page_info: Dict) -> str:
         """从页面信息中提取 Markdown 内容
         
@@ -660,6 +737,13 @@ class MinerUParser:
             ParseResult: 解析结果
         """
         from app.services.document_parser.base_parser import ParseResult
+        
+        metadata = {
+            "file_name": Path(file_path).name,
+            "file_size": os.path.getsize(file_path),
+            "file_type": "docx",
+            "parser": "MinerUParser",
+        }
         
         try:
             from docx import Document

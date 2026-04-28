@@ -7,6 +7,8 @@
 支持的文档格式：
 - .txt: 纯文本文件
 - .md: Markdown 文件（会保留标题结构进行智能分割）
+- .pdf: PDF 文档
+- .docx/.doc: Word 文档
 
 文件大小限制：10MB
 """
@@ -26,7 +28,7 @@ router = APIRouter()
 UPLOAD_DIR = Path("./uploads")
 
 # 支持的文件扩展名
-ALLOWED_EXTENSIONS = ["txt", "md"]
+ALLOWED_EXTENSIONS = ["txt", "md", "markdown", "pdf", "docx", "doc"]
 
 # 单个文件最大大小（10MB）
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -79,7 +81,7 @@ async def upload_file(file: UploadFile = File(...)):
         if file_extension not in ALLOWED_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"不支持的文件格式，仅支持: {', '.join(ALLOWED_EXTENSIONS)}",
+                detail=f"不支持的文件格式，仅支持: .txt, .md, .markdown, .pdf, .docx, .doc",
             )
 
         # 步骤 4：创建上传目录
