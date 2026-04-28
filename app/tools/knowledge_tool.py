@@ -3,35 +3,82 @@
 从向量数据库（Milvus）中检索与用户问题相关的文档片段。
 这是 RAG（检索增强生成）系统的核心工具。
 
+增强功能（v2）：
+1. 混合检索：结合 BM25 关键词检索和向量语义检索
+2. RRF 融合：使用 Reciprocal Rank Fusion 算法合并结果
+3. 重排序：可选使用 BGE-Reranker 模型精细排序
+4. 评估指标：计算召回率、精确率、MRR、NDCG 等
+
 工作原理：
 1. 用户提出问题
-2. 将问题嵌入为向量（embedding）
-3. 在 Milvus 中检索最相似的 top-k 个文档块
-4. 返回格式化的文档内容作为上下文
-5. LLM 基于上下文生成回答
+2. 并行执行 BM25 检索和向量检索
+3. 使用 RRF 算法融合两个检索结果
+4. 可选：使用重排序模型进一步优化
+5. 返回格式化的文档内容作为上下文
 
 技术细节：
-- 使用 LangChain VectorStore 的 as_retriever() 接口
-- 检索参数：top_k = config.rag_top_k（默认 3）
-- 返回格式：Tuple[str, List[Document]]（内容 + 原始文档）
+- BM25: 擅长精确关键词匹配，适合技术术语查询
+- 向量检索: 擅长语义匹配，适合同义词、多义词查询
+- RRF: 简单有效的融合算法，无需训练参数
+- Reranker: 使用交叉编码器进行精细排序
 
 @tool 装饰器参数：
 - response_format="content_and_artifact": 返回值包含内容和原始对象两部分
   用于需要同时返回格式化文本和原始文档的场景
 """
 
-from typing import List, Tuple  # 类型注解
+from typing import List, Tuple, Optional, Dict, Any
 
-from langchain_core.documents import Document  # LangChain 文档对象
-from langchain_core.tools import tool         # LangChain 工具装饰器
-from loguru import logger                    # 日志记录器
+from langchain_core.documents import Document
+from langchain_core.tools import tool
+from loguru import logger
 
-from app.config import config                          # 全局配置
-from app.services.vector_store_manager import vector_store_manager  # 向量存储管理器
+from app.config import config
+from app.services.vector_store_manager import vector_store_manager
+
+# 尝试导入混合检索器
+try:
+    from app.services.hybrid_retriever import HybridRetriever, RetrievalResult
+    _hybrid_retriever_available = True
+except ImportError as e:
+    _hybrid_retriever_available = False
+    logger.warning(f"混合检索器不可用: {e}")
+
+
+def _get_hybrid_retriever() -> Optional['HybridRetriever']:
+    """获取或创建混合检索器实例（单例模式）
+
+    Returns:
+        HybridRetriever 实例或 None（如果不可用）
+    """
+    if not _hybrid_retriever_available:
+        return None
+
+    global _hybrid_retriever
+    if '_hybrid_retriever' not in globals():
+        from app.services.vector_search_service import vector_search_service
+        from app.core.milvus_client import milvus_client
+
+        _hybrid_retriever = HybridRetriever(
+            vector_service=vector_search_service,
+            milvus_client=milvus_client,
+            collection_name="biz",
+            use_reranker=True,
+            rrf_k=60,
+            alpha_bm25=0.4,
+            alpha_vector=0.6,
+        )
+
+    return _hybrid_retriever
 
 
 @tool(response_format="content_and_artifact")
-def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
+def retrieve_knowledge(
+    query: str,
+    top_k: Optional[int] = None,
+    use_hybrid: bool = True,
+    relevant_doc_ids: Optional[List[str]] = None,
+) -> Tuple[str, List[Document]]:
     """从知识库中检索相关信息来回答问题
 
     当用户的问题涉及专业知识、文档内容或需要参考资料时，Agent 会自动调用此工具。
@@ -44,16 +91,18 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
     - Agent 基于文档内容生成回答
 
     工作流程：
-    1. 获取 VectorStore 实例
-    2. 创建检索器（配置 top_k）
-    3. 调用检索器获取相关文档
-    4. 格式化文档为字符串上下文
-    5. 返回 (上下文文本, 原始文档列表)
+    1. 尝试使用混合检索（BM25 + 向量 + RRF）
+    2. 如果混合检索不可用，降级到向量检索
+    3. 格式化文档为字符串上下文
+    4. 返回 (上下文文本, 原始文档列表)
 
     Args:
         query: 用户的查询文本
-              通常是用户问题的原文或关键词
-              示例："CPU 使用率过高怎么办"
+            通常是用户问题的原文或关键词
+            示例："CPU 使用率过高怎么办"
+        top_k: 返回的文档数量（默认使用 config.rag_top_k）
+        use_hybrid: 是否使用混合检索（默认 True）
+        relevant_doc_ids: 相关文档 ID 列表（用于评估，可选）
 
     Returns:
         Tuple[str, List[Document]]: 元组包含
@@ -70,28 +119,55 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
         ("没有找到相关信息。", [])
     """
     try:
-        logger.info(f"知识检索工具被调用: query='{query}'")
+        k = top_k if top_k is not None else config.rag_top_k
+        logger.info(f"知识检索工具被调用: query='{query}', top_k={k}, use_hybrid={use_hybrid}")
 
-        # 获取 VectorStore 实例
-        vector_store = vector_store_manager.get_vector_store()
+        docs: List[Document] = []
+        retrieval_info: Dict[str, Any] = {}
 
-        # 创建检索器
-        # as_retriever() 将 VectorStore 转换为检索器接口
-        # search_kwargs={"k": config.rag_top_k} 设置返回的文档数量
-        retriever = vector_store.as_retriever(
-            search_kwargs={"k": config.rag_top_k}
-        )
+        # 1. 尝试使用混合检索
+        if use_hybrid and _hybrid_retriever_available and config.use_hybrid_retrieval:
+            try:
+                retriever = _get_hybrid_retriever()
+                if retriever:
+                    results = retriever.search(
+                        query=query,
+                        top_k=k,
+                        relevant_doc_ids=relevant_doc_ids,
+                    )
 
-        # 执行检索
-        docs = retriever.invoke(query)
+                    # 转换为 Document 对象
+                    docs = _results_to_documents(results)
+
+                    # 获取评估指标
+                    metrics = retriever.get_metrics()
+                    if metrics:
+                        retrieval_info = metrics.to_dict()
+
+                    logger.info(
+                        f"混合检索完成: {len(docs)} 个结果, "
+                        f"recall={retrieval_info.get('recall', 0):.4f}"
+                    )
+                else:
+                    raise RuntimeError("混合检索器初始化失败")
+            except Exception as e:
+                logger.warning(f"混合检索失败: {e}，降级到向量检索")
+                docs = _fallback_vector_search(query, k)
+        else:
+            # 2. 使用传统向量检索
+            docs = _fallback_vector_search(query, k)
 
         # 无结果处理
         if not docs:
             logger.warning("未检索到相关文档")
             return "没有找到相关信息。", []
 
-        # 格式化文档为上下文字符串
+        # 3. 格式化文档为上下文字符串
         context = format_docs(docs)
+
+        # 添加检索信息（用于调试和分析）
+        if retrieval_info:
+            logger.info(f"检索指标: {retrieval_info}")
 
         logger.info(f"检索到 {len(docs)} 个相关文档")
         return context, docs
@@ -100,6 +176,70 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
         logger.error(f"知识检索工具调用失败: {e}")
         # 返回错误信息，不抛出异常（让 Agent 能继续处理）
         return f"检索知识时发生错误: {str(e)}", []
+
+
+def _fallback_vector_search(query: str, k: int) -> List[Document]:
+    """降级到传统向量检索
+
+    Args:
+        query: 查询文本
+        k: 返回数量
+
+    Returns:
+        List[Document]: 文档列表
+    """
+    logger.info("使用降级向量检索")
+
+    try:
+        vector_store = vector_store_manager.get_vector_store()
+        retriever = vector_store.as_retriever(
+            search_kwargs={"k": k}
+        )
+        return retriever.invoke(query)
+    except Exception as e:
+        logger.error(f"向量检索失败: {e}")
+        return []
+
+
+def _results_to_documents(results: List['RetrievalResult']) -> List[Document]:
+    """将混合检索结果转换为 Document 对象
+
+    Args:
+        results: 混合检索结果
+
+    Returns:
+        List[Document]: LangChain Document 对象列表
+    """
+    docs = []
+
+    for result in results:
+        # 构建 Document 对象
+        metadata = result.metadata.copy() if result.metadata else {}
+        metadata["_score"] = result.score
+        metadata["_bm25_score"] = result.bm25_score
+        metadata["_vector_score"] = result.vector_score
+        metadata["_rank"] = result.rank
+
+        doc = Document(
+            page_content=result.content,
+            metadata=metadata
+        )
+        docs.append(doc)
+
+    return docs
+
+
+def get_retrieval_metrics() -> Optional[Dict[str, Any]]:
+    """获取上次检索的评估指标
+
+    Returns:
+        Dict: 评估指标或 None
+    """
+    retriever = _get_hybrid_retriever()
+    if retriever:
+        metrics = retriever.get_metrics()
+        return metrics.to_dict() if metrics else None
+    return None
 
 
 def format_docs(docs: List[Document]) -> str:

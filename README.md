@@ -14,6 +14,33 @@
 - 🌐 **Web 界面** - 现代化 UI，支持多种对话模式：快速问答/流式对话
 - 🔌 **MCP 集成** - 日志查询和监控数据工具接入
 
+## ✨ 项目亮点
+
+### 1. 混合检索引擎 (Hybrid Retrieval)
+结合多种检索方式，显著提升知识库召回率：
+- **BM25 关键词检索** - 精准匹配技术术语，支持中英文混合分词
+- **向量语义检索** - 理解同义词和多义词，捕捉语义相似性
+- **RRF 融合算法** - 无需训练参数，简单高效地融合多路检索结果
+- **BGE 重排序 (Reranker)** - 使用交叉编码器进行精细化二次排序
+
+### 2. 智能文档解析 (Document Parser)
+支持多种文档格式的智能解析：
+- **MinerU 解析** - PDF/Word 版面分析、表格识别、公式识别
+- **Markdown 解析** - 保留标题层级结构
+- **纯文本解析** - 简单文本提取
+
+### 3. 可量化的检索评估体系
+内置完整的检索质量评估指标：
+- **召回率 (Recall)** - 确保不遗漏重要文档
+- **精确率 (Precision)** - 确保返回结果的相关性
+- **F1 分数** - 综合评估召回与精确的平衡
+- **MRR / NDCG** - 评估排序质量
+
+### 4. 企业级 AIOps 智能诊断
+基于 Plan-Execute-Replan 模式的自动故障诊断：
+- 自动制定诊断计划 → 智能工具调用 → 动态调整步骤 → 生成结构化报告
+- 流式输出诊断过程，实时可见
+
 ## 🛠️ 技术栈
 
 - **框架**: FastAPI + LangChain + LangGraph
@@ -97,14 +124,17 @@ timeout /t 10
 # 7. 启动 MCP 服务
 # 启动 CLS 日志查询服务（新开一个 PowerShell 窗口）
 python mcp_servers/cls_server.py
-
+& "C:\Users\ASUS\AppData\Local\Programs\Python\Python312\python.exe" mcp_servers/cls_server.py
 # 启动 Monitor 监控服务（新开一个 PowerShell 窗口）
 python mcp_servers/monitor_server.py
+
+& "C:\Users\ASUS\AppData\Local\Programs\Python\Python312\python.exe" mcp_servers/monitor_server.py
 
 # 8. 启动 FastAPI 主服务（新开一个 PowerShell 窗口）
 # 注意：日志会自动输出到 logs\app_YYYY-MM-DD.log
 python -m uvicorn app.main:app --host 0.0.0.0 --port 9900
 
+& "C:\Users\ASUS\AppData\Local\Programs\Python\Python312\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 9900
 # 9. 上传文档到向量库（新开一个 PowerShell 窗口）
 # 等待服务启动完成后执行
 timeout /t 5

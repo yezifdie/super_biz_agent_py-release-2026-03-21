@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     # 使用不带扩展思考的模型可以加快响应速度、减少 token 消耗
     rag_model: str = "qwen-max"
 
+    # ========== 混合检索配置 ==========
+    # 混合检索 = BM25 关键词检索 + 向量语义检索 + RRF 融合
+    # 详细说明见 app/services/hybrid_retriever.py
+    use_hybrid_retrieval: bool = True        # 是否启用混合检索
+    use_reranker: bool = True               # 是否使用重排序模型
+    rrf_k: int = 60                        # RRF 融合平滑参数（通常 60）
+    bm25_weight: float = 0.4                # BM25 检索权重 (bm25_weight + vector_weight = 1.0)
+    vector_weight: float = 0.6              # 向量检索权重
+    rerank_top_n: int = 20                 # 重排序时取前 N 个结果
+
     # ========== 文档分块配置 ==========
     # 将长文档切割成小块时的参数配置
     # 分块策略直接影响 RAG 检索质量：块太小丢失上下文，块太大引入噪声
